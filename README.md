@@ -12,8 +12,9 @@ docker compose up -d --build
 
 启动后打开浏览器访问：
 
-- 编辑器主页： **http://localhost:8000**
-- API 文档（Swagger）： http://localhost:8000/docs
+- 编辑器主页（Web）： **http://localhost:8000**
+- 只读分享页（Web）： http://localhost:8000/share.html?token=分享令牌
+- API 文档（Swagger）： http://localhost:8000/docs （业务接口统一在 `http://localhost:8000/api/...`，端口均为 **8000**）
 
 停止：`docker compose down`（数据保留在命名卷中；加 `-v` 可同时删除数据卷）。
 
@@ -39,6 +40,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 此时数据库默认为项目根目录下的 editor.db；可用环境变量 DB_PATH 覆盖
 ```
+
+本地运行的访问地址与端口同上：编辑器主页 http://localhost:8000 ，分享页 http://localhost:8000/share.html ，API 文档 http://localhost:8000/docs （基础路径 `/api/...`）。如需换端口，改 `uvicorn --port` 即可（容器部署则改 `docker-compose.yml` 的端口映射）。
 
 ## 功能说明
 
@@ -94,6 +97,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 结果按顺序展示每一步的 **节点 → 所选选项 → 目标节点**，勾选选项带 ✓ 标记，终点单独标出；点击任一节点名可将该节点居中定位到画布并选中；
 - 规划是只读计算（`POST /api/route-plan`，请求体即当前画布内容，不落库）：**不保存脚本、不生成运行记录、不改变分支覆盖统计**。
 
+### 改稿影响分析
+
+改稿后担心历史作答对不上新画布？工具栏「**🩺 改稿影响分析**」以**当前画布（含未保存修改）**为基准，对本脚本的**运行预览**与**只读分享作答**记录逐条重放核对：
+
+- 服务端从**当前起点**出发，按答卷记录中的**历史选项顺序**逐步重放，逐步核对**跳转目标**，并只返回每个会话遇到的**首个断点**及原因；
+- 识别的断点：**起点改变**（`start_changed`）、**节点消失**（`node_missing`）、**选项消失**（`option_missing`）、**跳转改指/改成未连接**（`redirected`）、**提前终止**（`early_terminal`，中途节点变成终点或没有选项）、**已结束答卷不再结束**（`ended_no_longer_terminal`）；
+- **未完成答卷只核对已答部分**：暂停点之后的差异不判为受影响，暂停节点本身变成终点也算兼容；已答路径逐步完全匹配即标为**兼容**；
+- 面板汇总**作答会话总数、兼容会话数、受影响会话数**（以及预览/分享来源分布与各断点原因数量）；展开任一条记录可查看完整历史路径，断点处高亮并可点击「🎯 定位断点节点」居中定位到画布（节点已删除时提示无法定位）；
+- 每次打开面板或点击「↻ 重新分析当前画布」都会即时重放，因此不必先保存；分析期间画布又被改动时会提示结果可能已过期；
+- 分析是**只读计算**（`POST /api/scripts/{id}/impact`，请求体即当前画布内容）：**不保存脚本、不改写作答记录、不改变分支覆盖统计**。
+
 ### JSON 导入 / 导出
 
 - **导出**：下载形如 `脚本名.json` 的文件，格式为 `{"format":"branch-interview-script","version":1,"name":...,"content":...}`；
@@ -136,6 +150,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET/PUT/DELETE | `/api/scripts/{id}` | 读取 / 更新 / 删除 |
 | POST | `/api/scripts/{id}/validate` | 服务端环路/孤立/未覆盖出口校验 |
 | GET | `/api/scripts/{id}/coverage` | 分支覆盖统计：各选项被选择次数 / 从未走过的选项 / 覆盖率 |
+| POST | `/api/scripts/{id}/impact` | 改稿影响分析：请求体为当前画布 content，逐条重放预览/分享作答，返回兼容数与受影响会话的首个断点（只读计算，不落库） |
 | POST | `/api/route-plan` | 指定选项路线规划：请求体为当前画布 content + 1～6 个勾选选项，返回最短选择序列或无解（只读计算，不落库） |
 | GET | `/api/scripts/{id}/export` | 导出 JSON |
 | POST | `/api/import` | 导入 JSON |
@@ -151,8 +166,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：CRUD / 校验 / 路线规划 / 导入导出 / 分享 / 运行
-│   ├── graph.py       # 图算法：Tarjan 环路、BFS 可达性、出口检查、路线规划、跳转
+│   ├── main.py        # FastAPI 路由：CRUD / 校验 / 路线规划 / 改稿影响分析 / 导入导出 / 分享 / 运行
+│   ├── graph.py       # 图算法：Tarjan 环路、BFS 可达性、出口检查、路线规划、改稿重放核对、跳转
 │   └── db.py          # SQLite 连接与建表
 ├── static/
 │   ├── index.html     # 编辑器单页

@@ -213,6 +213,186 @@ def plan_route(content: dict[str, Any], waypoints: list[dict]) -> dict[str, Any]
     }
 
 
+# ---- revision impact replay -----------------------------------------------
+
+def _display_title(node_map: dict, node_id: Any, fallback: str = "") -> str:
+    """Human-friendly node name: current canvas title, else a recorded fallback."""
+    node = node_map.get(node_id) if node_id is not None else None
+    if node is not None:
+        return node.get("title") or str(node_id)
+    return fallback or (str(node_id) if node_id is not None else "—")
+
+
+def replay_run(content: dict[str, Any], steps: list[dict] | None,
+               finished: bool) -> dict[str, Any]:
+    """Replay one recorded answer session against the CURRENT canvas content.
+
+    Replay starts at the canvas start node and follows the recorded choices in
+    order, comparing each jump target with the recorded path. Only the FIRST
+    breakpoint is reported. Detected breakpoints:
+
+      start_changed               : canvas start no longer matches the answer's
+      node_missing (at/after start): a node the answer reached (or started at)
+                                    no longer exists
+      option_missing              : the chosen option disappeared from its node
+      redirected                  : the option now jumps somewhere else (or is
+                                    unconnected), though the recorded target
+                                    still exists
+      early_terminal              : a node mid-answer is now an end (terminal
+                                    flag or no options) while more answers exist
+      ended_no_longer_terminal    : a finished answer's last node is no longer
+                                    an end on the current canvas
+
+    Unfinished answers are only checked over their answered part: an exact
+    replay is reported as ``compatible`` even when the paused-at node has since
+    become terminal. Nothing here mutates anything — pure read-only analysis.
+    """
+    node_map = {n.get("id"): n for n in content.get("nodes", []) or []}
+    steps = list(steps or [])
+    choice_count = sum(1 for s in steps if s.get("option_id"))
+
+    def is_end(node: dict) -> bool:
+        return bool(node.get("terminal")) or not (node.get("options") or [])
+
+    def verdict(reason: str, message: str, *, step_index, choice_index,
+                node_id, locate_node_id=None, option_id=None, detail=None):
+        locate = locate_node_id if locate_node_id in node_map else None
+        return {"status": "affected", "choice_count": choice_count,
+                "breakpoint": {
+                    "reason": reason,
+                    "message": message,
+                    "step_index": step_index,      # 0-based index into steps
+                    "choice_index": choice_index,  # 1-based choice ordinal, may be None
+                    "node_id": node_id,
+                    "option_id": option_id,
+                    "locate_node_id": locate,      # existing canvas node to focus
+                    "detail": detail or {},
+                }}
+
+    if not steps:
+        return {"status": "affected", "choice_count": 0, "breakpoint": {
+            "reason": "empty_record", "message": "答卷记录为空，无法重放核对。",
+            "step_index": None, "choice_index": None, "node_id": None,
+            "option_id": None, "locate_node_id": None, "detail": {}}}
+
+    recorded_start = steps[0].get("node_id")
+    recorded_start_title = steps[0].get("title") or str(recorded_start)
+    canvas_start = content.get("start_node_id")
+
+    if canvas_start not in node_map:
+        # Canvas has no valid entry point at all.
+        if recorded_start in node_map:
+            return verdict(
+                "start_changed",
+                f"起点已改变：答卷从「{_display_title(node_map, recorded_start, recorded_start_title)}」开始，"
+                f"但当前画布未设置有效的起始节点。",
+                step_index=0, choice_index=None, node_id=recorded_start,
+                locate_node_id=recorded_start,
+                detail={"current_start_node_id": canvas_start, "current_start_title": "",
+                        "recorded_start_node_id": recorded_start,
+                        "recorded_start_title": recorded_start_title})
+        return verdict(
+            "node_missing",
+            f"答卷的起始节点「{recorded_start_title}」已从画布消失，且当前画布未设置有效的起始节点。",
+            step_index=0, choice_index=None, node_id=recorded_start,
+            detail={"missing_node_id": recorded_start, "recorded_title": recorded_start_title})
+
+    if canvas_start != recorded_start:
+        return verdict(
+            "start_changed",
+            f"起点已改变：答卷从「{recorded_start_title}」开始，当前画布起点为"
+            f"「{_display_title(node_map, canvas_start)}」。",
+            step_index=0, choice_index=None, node_id=canvas_start,
+            locate_node_id=canvas_start,
+            detail={"current_start_node_id": canvas_start,
+                    "current_start_title": _display_title(node_map, canvas_start),
+                    "recorded_start_node_id": recorded_start,
+                    "recorded_start_title": recorded_start_title})
+
+    cur = node_map[canvas_start]
+    answered = 0
+    for i, step in enumerate(steps):
+        option_id = step.get("option_id")
+        if not option_id:
+            continue  # start node and mid-restart entries carry no choice
+        answered += 1
+        n = answered
+        next_step = steps[i + 1] if i + 1 < len(steps) else None
+        recorded_next = next_step.get("node_id") if next_step else None
+        node_desc = _display_title(node_map, cur["id"])
+        answer_desc = step.get("answer") or option_id
+
+        # 1. answer path continues, but the canvas flow stops here already
+        if is_end(cur):
+            return verdict(
+                "early_terminal",
+                f"第 {n} 次选择所在节点「{node_desc}」现在会提前结束"
+                f"（已标记为终点或没有任何选项），答卷在此被截断，后续作答无法继续。",
+                step_index=i, choice_index=n, node_id=cur["id"],
+                locate_node_id=cur["id"], option_id=step.get("option_id"),
+                detail={"node_title": node_desc, "option_answer": step.get("answer")})
+
+        # 2. the chosen option no longer exists on the node
+        opt = next((o for o in (cur.get("options") or [])
+                    if o.get("id") == step.get("option_id")), None)
+        if opt is None:
+            return verdict(
+                "option_missing",
+                f"第 {n} 次选择的选项「{answer_desc}」已从节点「{node_desc}」删除，答卷路径无法继续。",
+                step_index=i, choice_index=n, node_id=cur["id"],
+                locate_node_id=cur["id"], option_id=step.get("option_id"),
+                detail={"node_title": node_desc, "option_answer": step.get("answer")})
+
+        # 3. the node the answer arrived at vanished from the canvas
+        if recorded_next not in node_map:
+            gone_title = (next_step.get("title") if next_step else None) or str(recorded_next)
+            return verdict(
+                "node_missing",
+                f"第 {n} 次选择后到达的节点「{gone_title}」已从画布消失，答卷路径无法继续。",
+                step_index=i + 1 if next_step else i, choice_index=n,
+                node_id=recorded_next, locate_node_id=cur["id"],
+                option_id=opt.get("id"),
+                detail={"missing_node_id": recorded_next, "recorded_title": gone_title,
+                        "source_node_id": cur["id"], "source_node_title": node_desc})
+
+        # 4. option still exists, recorded node still exists, but the jump moved
+        target = opt.get("target_id")
+        if target != recorded_next:
+            old_desc = _display_title(node_map, recorded_next,
+                                      next_step.get("title") if next_step else "")
+            if not target:
+                new_desc = "未连接任何节点"
+            elif target in node_map:
+                new_desc = f"改指到「{_display_title(node_map, target)}」"
+            else:
+                new_desc = f"指向已消失的节点 {target}"
+            return verdict(
+                "redirected",
+                f"第 {n} 次选择的选项「{opt.get('label') or answer_desc}」跳转已改指："
+                f"原来到达「{old_desc}」，现在{new_desc}。",
+                step_index=i, choice_index=n, node_id=cur["id"],
+                locate_node_id=cur["id"], option_id=opt.get("id"),
+                detail={"option_label": opt.get("label", ""),
+                        "recorded_target_id": recorded_next, "recorded_target_title": old_desc,
+                        "current_target_id": target,
+                        "current_target_title": _display_title(node_map, target) if target in node_map else "",
+                        "current_connected": bool(target and target in node_map)})
+
+        cur = node_map[recorded_next]
+
+    # 5. a finished answer must still end at its final node
+    if finished and not is_end(cur):
+        return verdict(
+            "ended_no_longer_terminal",
+            f"该答卷原在节点「{_display_title(node_map, cur['id'])}」结束，"
+            f"但该节点现在不再是终点（仍有可继续选择的分支）。",
+            step_index=len(steps) - 1, choice_index=None, node_id=cur["id"],
+            locate_node_id=cur["id"],
+            detail={"node_title": _display_title(node_map, cur["id"])})
+
+    return {"status": "compatible", "choice_count": choice_count, "breakpoint": None}
+
+
 # ---- runtime traversal ----------------------------------------------------
 
 def step(content: dict, node_id: str, option_id: str | None = None) -> dict[str, Any]:

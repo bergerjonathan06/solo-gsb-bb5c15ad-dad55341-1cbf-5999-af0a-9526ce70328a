@@ -255,6 +255,148 @@ function renderCoverageModal(c) {
   });
 }
 
+// ---------------------------------------------------------------- revision impact analysis
+// 改稿影响分析: the CURRENT canvas (unsaved edits included) is POSTed to the
+// server, which replays every saved answer session of this script — both
+// editor previews and read-only share answers — from the canvas start node,
+// following the recorded choices and verifying each jump target. The first
+// breakpoint (start changed / node or option vanished / redirect / premature
+// end / finished answer no longer ending) is reported with its node. Unfinished
+// answers are only checked over their answered part; an exact replay is
+// "compatible". Read-only: nothing is saved, no run record changes, coverage
+// stats are untouched.
+
+const impactState = { result: null, contentSnap: null };
+
+const IMPACT_REASONS = {
+  start_changed: { label: "起点改变", cls: "redirected" },
+  node_missing: { label: "节点消失", cls: "missing" },
+  option_missing: { label: "选项消失", cls: "missing" },
+  redirected: { label: "跳转改指", cls: "redirected" },
+  early_terminal: { label: "提前终止", cls: "terminal" },
+  ended_no_longer_terminal: { label: "已结束不再结束", cls: "terminal" },
+  empty_record: { label: "记录为空", cls: "missing" },
+};
+
+async function openImpact() {
+  if (!state.currentId || !state.doc) return;
+  openModal("impactModal");
+  $("#impactSummary").innerHTML = `<div class="cov-empty">正在以当前画布重放核对待测作答记录…</div>`;
+  $("#impactList").innerHTML = "";
+  await runImpact();
+}
+
+async function runImpact() {
+  if (!state.currentId || !state.doc) return;
+  const btn = $("#impactRefresh");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/impact`, {
+      method: "POST",
+      body: { content: state.doc.content },
+    });
+    impactState.result = r;
+    impactState.contentSnap = JSON.stringify(state.doc.content);
+    renderImpact(r);
+  } catch (err) {
+    $("#impactSummary").innerHTML = `<div class="route-none">改稿影响分析失败：${esc(err.message)}</div>`;
+    $("#impactList").innerHTML = "";
+  }
+  btn.disabled = false;
+}
+
+function impactRedirectNote(d) {
+  if (!d.current_connected) {
+    return d.current_target_id
+      ? `现在指向已消失节点 ${esc(d.current_target_id)}`
+      : "现在该选项已改为未连接";
+  }
+  return `现在改指到「${esc(d.current_target_title || d.current_target_id)}」`;
+}
+
+function renderImpactSteps(s) {
+  const bp = s.breakpoint;
+  return s.steps.map((st, i) => {
+    const exists = !!getNode(st.node_id);
+    const isBp = bp && bp.step_index === i;
+    const note = isBp && bp.reason === "redirected"
+      ? `<span class="imp-bp-note">↳ ${impactRedirectNote(bp.detail)}</span>` : "";
+    return `
+      <div class="imp-step ${isBp ? "bp" : ""}">
+        <span class="route-idx">${i === 0 ? "起" : i}</span>
+        ${exists
+          ? `<button class="route-node" data-imp-node="${esc(st.node_id)}">${esc(st.title || st.node_id)}</button>`
+          : `<span class="imp-gone" title="该节点已从当前画布消失">${esc(st.title || st.node_id)}（已消失）</span>`}
+        ${st.answer ? `<span class="imp-ans">—「${esc(st.answer)}」→</span>` : ""}
+        ${isBp ? `<span class="imp-bp-tag">断点</span>` : ""}
+        ${note}
+      </div>`;
+  }).join("");
+}
+
+function renderImpact(r) {
+  const sumEl = $("#impactSummary");
+  const listEl = $("#impactList");
+  if (!r) { sumEl.innerHTML = ""; listEl.innerHTML = ""; return; }
+  if (!r.has_runs) {
+    sumEl.innerHTML = `<div class="cov-empty-big">📭 该脚本尚无可核对的作答记录<br>
+      <small>保存脚本后使用「▶ 运行预览」，或将「🔗 只读分享」链接发给受访者作答，这里即会按历史选项顺序逐条重放核对。</small></div>`;
+    listEl.innerHTML = "";
+    return;
+  }
+
+  const stale = impactState.contentSnap !== JSON.stringify(state.doc.content);
+  const reasonChips = Object.entries(r.reason_counts || {}).map(([reason, n]) => {
+    const meta = IMPACT_REASONS[reason] || { label: reason, cls: "missing" };
+    return `<span class="imp-reason-chip ${meta.cls}">${meta.label} × ${n}</span>`;
+  }).join("");
+  sumEl.innerHTML =
+    `<div class="imp-notes">
+       ${state.dirty ? '<span class="imp-chip dirty">分析基于当前画布，已含未保存修改</span>' : ""}
+       ${stale ? '<span class="imp-chip stale">⚠ 分析后画布又被改动，结果可能已过期，请重新分析</span>' : ""}
+     </div>
+     <div class="cov-cards">
+       <div><b>${r.total}</b><span>作答会话</span></div>
+       <div class="imp-num-ok"><b>${r.compatible_count}</b><span>兼容</span></div>
+       <div class="imp-num-bad"><b>${r.affected_count}</b><span>受影响</span></div>
+       <div><b>${r.preview_runs}</b><span>编辑器预览</span></div>
+       <div><b>${r.share_runs}</b><span>分享作答</span></div>
+     </div>
+     ${reasonChips ? `<div class="imp-reasons">${reasonChips}</div>` :
+       '<div class="cov-line">全部会话与当前画布兼容 ✓（未完成答卷仅核对已答部分）</div>'}`;
+
+  listEl.innerHTML = r.sessions.map((s) => {
+    const affected = s.status === "affected";
+    const meta = affected ? (IMPACT_REASONS[s.breakpoint.reason] || { label: "受影响", cls: "missing" }) : null;
+    const locate = affected && s.breakpoint.locate_node_id;
+    return `
+    <details class="imp-sess ${affected ? "bad" : "ok"}" ${affected ? "open" : ""}>
+      <summary>
+        <span class="imp-status ${affected ? "bad" : "ok"}">${affected ? "⚠ 受影响" : "✓ 兼容"}</span>
+        <span class="imp-meta">#${s.run_id} · ${s.mode === "share" ? "分享作答" : "编辑器预览"} ·
+          ${s.finished ? "已结束" : "未完成"} · ${s.choice_count} 次选择</span>
+        ${affected ? `<span class="imp-reason-tag ${meta.cls}">${meta.label}</span>` : ""}
+        <span class="imp-date">${esc((s.created_at || "").replace("T", " ").slice(0, 16))}</span>
+      </summary>
+      <div class="imp-body">
+        ${affected ? `
+          <div class="imp-bp-box ${meta.cls}">
+            <div><b>首个断点 · ${meta.label}</b>：${esc(s.breakpoint.message)}</div>
+            ${locate ? `<button class="imp-locate" data-imp-node="${esc(locate)}">🎯 定位断点节点</button>`
+                      : '<span class="imp-no-locate">（断点节点已不在画布上，无法定位）</span>'}
+          </div>` :
+          `<div class="imp-ok-box">✓ ${s.finished ? "整份答卷在当前画布上可完整重放。"
+            : "已答部分在当前画布上可完整重放（未完成答卷不核对后续）。"}</div>`}
+        <div class="imp-steps">${renderImpactSteps(s)}</div>
+      </div>
+    </details>`;
+  }).join("");
+
+  listEl.querySelectorAll("[data-imp-node]").forEach((b) => {
+    b.onclick = () => locateNodeOnCanvas(b.dataset.impNode);
+  });
+}
+
 // ---------------------------------------------------------------- route planning
 // 指定选项路线规划: check 1–6 options that have connected targets on the
 // CURRENT canvas (unsaved edits included); the server BFSes over
@@ -406,7 +548,7 @@ function renderRouteResult() {
 // Center the node in the viewport and select it (canvas + inspector).
 function locateNodeOnCanvas(id) {
   const n = getNode(id);
-  if (!n) return;
+  if (!n) { toast("该节点已不在当前画布上，无法定位"); return; }
   state.selectedNodeId = id;
   state.selectedEdge = null;
   const rect = $("#canvasWrap").getBoundingClientRect();
@@ -414,7 +556,7 @@ function locateNodeOnCanvas(id) {
     x: Math.round(rect.width / 2 - ((n.x || 0) + 115)),
     y: Math.round(rect.height / 2 - ((n.y || 0) + 60)),
   };
-  closeModal("routeModal");
+  document.querySelectorAll(".modal-mask.open").forEach((m) => m.classList.remove("open"));
   renderCanvas();
   renderInspector();
 }
@@ -880,6 +1022,8 @@ function bindToolbar() {
   $("#btnSave").onclick = saveScript;
   $("#btnPreview").onclick = openPreview;
   $("#btnCoverage").onclick = openCoverage;
+  $("#btnImpact").onclick = openImpact;
+  $("#impactRefresh").onclick = runImpact;
   $("#btnRoute").onclick = openRoute;
   $("#routeRun").onclick = runRoutePlan;
   $("#btnShare").onclick = openShare;

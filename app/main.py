@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .db import get_db, init_db
 from .graph import plan_route
+from .graph import replay_run
 from .graph import step as graph_step
 from .graph import validate as validate_content
 
@@ -74,6 +75,10 @@ class RouteOptionRef(BaseModel):
 class RoutePlanIn(BaseModel):
     content: ContentIn
     options: list[RouteOptionRef] = Field(default_factory=list)
+
+
+class ImpactIn(BaseModel):
+    content: ContentIn
 
 
 # ---- lifecycle ------------------------------------------------------------
@@ -271,6 +276,84 @@ def plan_route_endpoint(payload: RoutePlanIn):
             raise HTTPException(400, "勾选的选项未连接目标节点")
     waypoints = [{"node_id": n, "option_id": o} for n, o in refs]
     return plan_route(content, waypoints)
+
+
+# ---- revision impact analysis ---------------------------------------------
+
+@app.post("/api/scripts/{script_id}/impact")
+def script_impact(script_id: int, payload: ImpactIn):
+    """Replay every recorded answer session against the posted CURRENT canvas.
+
+    Both kinds of saved sessions belonging to this script are checked, exactly
+    like coverage aggregation:
+      * editor preview sessions (runs.mode = 'script', script_id matched)
+      * answer sessions created via read-only share links whose snapshot
+        belongs to this script (runs.mode = 'share', joined via shares)
+
+    The posted ``content`` is the caller's current canvas — saved or carrying
+    unsaved edits. For each session the server replays from the canvas start
+    node through the recorded choices, verifying each jump target, and reports
+    only the first breakpoint (start changed, node/option vanished, jump
+    redirected, premature end, or a finished answer whose end is no longer
+    terminal). Unfinished answers are only checked over their answered part; a
+    full match is reported as compatible. Read-only: nothing is written, no run
+    record changes and coverage statistics are never touched.
+    """
+    _fetch_script(script_id)  # 404 when the script itself is gone
+    content = payload.content.model_dump()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT r.id AS id, r.mode AS mode, r.finished AS finished, "
+            "r.steps AS steps, r.created_at AS created_at "
+            "FROM runs r LEFT JOIN shares s ON r.share_token = s.token "
+            "WHERE (r.mode = 'script' AND r.script_id = ?) "
+            "   OR (r.mode = 'share' AND s.script_id = ?) "
+            "ORDER BY r.id DESC",
+            (script_id, script_id),
+        ).fetchall()
+
+    sessions = []
+    affected = compatible = 0
+    preview_runs = share_runs = finished_runs = 0
+    reason_counts: dict[str, int] = {}
+    for row in rows:
+        if row["mode"] == "share":
+            share_runs += 1
+        else:
+            preview_runs += 1
+        finished = bool(row["finished"])
+        finished_runs += 1 if finished else 0
+        steps = json.loads(row["steps"])
+        result = replay_run(content, steps, finished)
+        if result["status"] == "affected":
+            affected += 1
+            reason = result["breakpoint"]["reason"]
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        else:
+            compatible += 1
+        sessions.append({
+            "run_id": row["id"],
+            "mode": row["mode"],
+            "finished": finished,
+            "created_at": row["created_at"],
+            "choice_count": result["choice_count"],
+            "status": result["status"],
+            "breakpoint": result["breakpoint"],
+            "steps": steps,
+        })
+
+    return {
+        "script_id": script_id,
+        "has_runs": bool(rows),
+        "total": len(rows),
+        "compatible_count": compatible,
+        "affected_count": affected,
+        "preview_runs": preview_runs,
+        "share_runs": share_runs,
+        "finished_runs": finished_runs,
+        "reason_counts": reason_counts,
+        "sessions": sessions,
+    }
 
 
 # ---- import / export ------------------------------------------------------
