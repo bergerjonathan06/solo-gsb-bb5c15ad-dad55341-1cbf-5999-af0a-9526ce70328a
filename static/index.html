@@ -31,6 +31,7 @@
       <button id="btnPreview">▶ 运行预览</button>
       <button id="btnCoverage" title="按已保存运行记录统计各选项被选择次数">📊 分支覆盖</button>
       <button id="btnRoute" title="勾选 1～6 个已连接选项，规划经过它们到达终点的最短选择序列">🧭 路线规划</button>
+      <button id="btnImpact" title="用当前画布（含未保存修改）逐条重放本脚本的预览与分享作答，定位首个不兼容断点">🧪 改稿影响分析</button>
       <button id="btnShare">🔗 只读分享</button>
       <button id="btnExport">导出 JSON</button>
       <button id="btnImport">导入 JSON</button>
@@ -119,6 +120,27 @@
     </div>
     <footer>
       <button data-close="routeModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- revision impact analysis modal -->
+<div class="modal-mask" id="impactModal">
+  <div class="modal wide">
+    <header>改稿影响分析<span class="close" data-close="impactModal">✕</span></header>
+    <div class="body">
+      <p class="impact-tip" id="impactTip">
+        以<b>当前画布</b>（含未保存修改）为新版脚本，服务端从<b>当前起点</b>按<b>历史选项顺序</b>逐条重放本脚本的
+        <b>运行预览</b>与<b>分享作答</b>记录，逐步核对跳转目标。起点改变、节点或选项消失、跳转改指、提前终止，
+        或已结束答卷不再结束时，标出<b>首个断点及原因</b>；未完成答卷只核对已答部分，完整匹配标为<b>兼容</b>。<br>
+        分析为<b>只读</b>计算：不保存脚本、不改写作答记录、不影响分支覆盖统计。
+      </p>
+      <div id="impactSummary"></div>
+      <div id="impactList"></div>
+    </div>
+    <footer>
+      <button id="impactRefresh">↻ 按当前画布重新分析</button>
+      <button data-close="impactModal">关闭</button>
     </footer>
   </div>
 </div>

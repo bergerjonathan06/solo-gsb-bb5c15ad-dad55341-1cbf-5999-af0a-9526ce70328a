@@ -414,10 +414,157 @@ function locateNodeOnCanvas(id) {
     x: Math.round(rect.width / 2 - ((n.x || 0) + 115)),
     y: Math.round(rect.height / 2 - ((n.y || 0) + 60)),
   };
-  closeModal("routeModal");
+  const open = document.querySelector(".modal-mask.open");
+  if (open) closeModal(open.id);
   renderCanvas();
   renderInspector();
 }
+
+// ---------------------------------------------------------------- revision impact analysis
+// 改稿影响分析: post the CURRENT canvas content (unsaved edits included) and
+// have the server replay every recorded session of this script (editor preview
+// runs + share-answer runs) from the current start node, following the
+// historical choices in order and verifying each jump target. The first
+// divergence is the breakpoint; unfinished runs are only checked up to the
+// part they answered and a full match is "compatible". Read-only: never saves
+// the script, never rewrites runs and never touches coverage statistics.
+
+const IMPACT_REASONS = {
+  start_changed: { label: "起点改变", cls: "start" },
+  node_missing: { label: "节点消失", cls: "missing" },
+  option_missing: { label: "选项消失", cls: "missing" },
+  edge_retargeted: { label: "跳转改指", cls: "retarget" },
+  early_terminal: { label: "提前终止", cls: "terminal" },
+  no_longer_finished: { label: "结束失效", cls: "terminal" },
+};
+
+const impactState = { lastResult: null };
+
+async function openImpact() {
+  if (!state.doc) { toast("请先打开一个脚本"); return; }
+  openModal("impactModal");
+  await runImpactAnalysis();
+}
+
+async function runImpactAnalysis() {
+  if (!state.currentId) return;
+  $("#impactSummary").innerHTML = `<div class="impact-loading">⏳ 正在以当前画布重放历史作答记录…</div>`;
+  $("#impactList").innerHTML = "";
+  try {
+    impactState.lastResult = await api(`/api/scripts/${state.currentId}/impact`, {
+      method: "POST",
+      body: { content: state.doc.content },
+    });
+  } catch (err) {
+    $("#impactSummary").innerHTML = `<div class="route-none">改稿影响分析失败：${esc(err.message)}</div>`;
+    return;
+  }
+  renderImpact(impactState.lastResult);
+}
+
+function renderImpact(r) {
+  const sumEl = $("#impactSummary");
+  const listEl = $("#impactList");
+  if (!r) return;
+  if (!r.has_runs) {
+    sumEl.innerHTML = `<div class="cov-empty-big">📭 该脚本暂无任何预览或分享作答记录<br>
+      <small>保存脚本后使用「▶ 运行预览」，或将「🔗 只读分享」链接发给受访者作答，即可在此核对改稿是否影响历史作答路径。</small></div>`;
+    listEl.innerHTML = "";
+    return;
+  }
+  const allOk = r.affected_count === 0;
+  const reasonChips = Object.entries(r.reason_counts || {})
+    .map(([type, n]) => {
+      const meta = IMPACT_REASONS[type] || { label: type, cls: "retarget" };
+      return `<span class="imp-chip ${meta.cls}">${meta.label} × ${n}</span>`;
+    }).join("");
+  sumEl.innerHTML =
+    (state.dirty ? `<div class="cov-stale">⚠ 当前画布含未保存修改，以下结论按当前画布（而非上次保存版本）重放。</div>` : "") +
+    `<div class="cov-cards">
+       <div><b>${r.run_count}</b><span>作答会话</span></div>
+       <div><b class="imp-ok-text">${r.compatible_count}</b><span>兼容</span></div>
+       <div><b class="${r.affected_count ? "imp-bad-text" : "imp-ok-text"}">${r.affected_count}</b><span>受影响</span></div>
+       <div><b>${r.preview_runs}</b><span>预览记录</span></div>
+       <div><b>${r.share_runs}</b><span>分享作答</span></div>
+     </div>
+     <div class="cov-line">
+       ${allOk
+         ? '<b class="imp-ok-text">✓ 全部记录与当前画布兼容</b>'
+         : `<b class="imp-bad-text">${r.affected_count}</b> 条会话存在断点：${reasonChips}`}
+     </div>`;
+
+  listEl.innerHTML = r.sessions.map(renderImpactSession).join("");
+  listEl.querySelectorAll("[data-imp-locate]").forEach((b) => {
+    b.onclick = () => {
+      const id = b.dataset.impLocate;
+      if (!getNode(id)) { toast("断点节点已不在当前画布，无法定位"); return; }
+      locateNodeOnCanvas(id);
+    };
+  });
+}
+
+function renderImpactSteps(s) {
+  const bp = s.breakpoint;
+  const bpIdx = bp ? bp.step_index : -1;
+  return s.steps.map((st, i) => {
+    const hasChoice = i < s.steps.length - 1 && !!st.option_id;
+    const isBp = i === bpIdx;
+    let mark = "";
+    if (isBp) {
+      mark = `<span class="imp-mark bp" title="首个断点">✕ 断点</span>`;
+    } else if (hasChoice && bp && i < bpIdx) {
+      mark = `<span class="imp-mark ok" title="跳转目标与当前画布一致">✓ 一致</span>`;
+    } else if (hasChoice && !bp) {
+      mark = `<span class="imp-mark ok" title="跳转目标与当前画布一致">✓ 一致</span>`;
+    }
+    return `<div class="imp-step ${isBp ? "bp" : ""}">
+      <span class="imp-idx">${i + 1}</span>
+      <div class="imp-step-body">
+        <div class="imp-node">${esc(st.title || st.node_id || "(未知节点)")}
+          <span class="imp-node-id">${esc(st.node_id || "")}</span>${mark}</div>
+        ${st.answer ? `<div class="imp-ans">↳ 回答：${esc(st.answer)}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderImpactSession(s) {
+  const compatible = s.status === "compatible";
+  const bp = s.breakpoint;
+  const meta = bp ? IMPACT_REASONS[bp.type] || { label: bp.type, cls: "retarget" } : null;
+  const locateBtn = bp && bp.node_exists
+    ? `<button class="imp-locate" data-imp-locate="${esc(bp.node_id)}">📍 在画布定位断点节点</button>`
+    : (bp ? `<span class="imp-gone">断点节点已从画布消失，无法定位</span>` : "");
+  const time = s.created_at ? `<span class="imp-meta">${esc(s.created_at.replace("T", " ").replace("+00:00", " UTC"))}</span>` : "";
+  return `
+    <div class="imp-session ${compatible ? "ok" : "bad"}">
+      <div class="imp-session-head">
+        <span class="imp-status ${compatible ? "ok" : "bad"}">${compatible ? "✓ 兼容" : "✕ 受影响"}</span>
+        <span class="imp-tag ${s.mode === "share" ? "share" : "preview"}">
+          ${s.mode === "share" ? "分享作答" : "运行预览"}</span>
+        <span class="imp-tag ${s.finished ? "finished" : "unfinished"}">
+          ${s.finished ? "已结束" : "未完成"}</span>
+        <span class="imp-meta">会话 #${s.run_id} · 已答 ${s.answered_count} 题</span>
+        <span class="imp-meta" style="margin-left:auto">${time}</span>
+      </div>
+      ${bp ? `
+        <div class="imp-reason ${meta.cls}">
+          <span class="imp-reason-tag">${meta.label}</span>
+          <span class="imp-reason-text">${esc(bp.reason)}</span>
+          ${locateBtn}
+        </div>` : `
+        <div class="imp-reason ok-text">
+          <span class="imp-reason-tag ok">完整匹配</span>
+          <span class="imp-reason-text">${s.finished ? "起点、每步跳转与结束位置均与当前画布一致。"
+            : `已答的 ${s.answered_count} 步跳转均与当前画布一致（未完成答卷只核对已答部分）。`}</span>
+        </div>`}
+      <details class="imp-detail">
+        <summary>展开作答路径（${s.step_count} 个节点）</summary>
+        <div class="imp-steps">${renderImpactSteps(s)}</div>
+      </details>
+    </div>`;
+}
+
 
 // ---------------------------------------------------------------- rendering
 
@@ -882,6 +1029,8 @@ function bindToolbar() {
   $("#btnCoverage").onclick = openCoverage;
   $("#btnRoute").onclick = openRoute;
   $("#routeRun").onclick = runRoutePlan;
+  $("#btnImpact").onclick = openImpact;
+  $("#impactRefresh").onclick = runImpactAnalysis;
   $("#btnShare").onclick = openShare;
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();

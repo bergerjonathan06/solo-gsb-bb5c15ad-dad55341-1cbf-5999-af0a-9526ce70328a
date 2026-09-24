@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import get_db, init_db
-from .graph import plan_route
+from .graph import analyze_impact, plan_route
 from .graph import step as graph_step
 from .graph import validate as validate_content
 
@@ -74,6 +74,10 @@ class RouteOptionRef(BaseModel):
 class RoutePlanIn(BaseModel):
     content: ContentIn
     options: list[RouteOptionRef] = Field(default_factory=list)
+
+
+class ImpactAnalysisIn(BaseModel):
+    content: ContentIn
 
 
 # ---- lifecycle ------------------------------------------------------------
@@ -271,6 +275,49 @@ def plan_route_endpoint(payload: RoutePlanIn):
             raise HTTPException(400, "勾选的选项未连接目标节点")
     waypoints = [{"node_id": n, "option_id": o} for n, o in refs]
     return plan_route(content, waypoints)
+
+
+# ---- revision impact analysis ---------------------------------------------
+
+@app.post("/api/scripts/{script_id}/impact")
+def revision_impact(script_id: int, payload: ImpactAnalysisIn):
+    """Replay every recorded answer of this script against the posted canvas.
+
+    The posted ``content`` is the caller's CURRENT canvas — unsaved edits
+    included. Both session sources are checked:
+      * editor preview sessions (runs.mode = 'script', script_id matched)
+      * answer sessions created via read-only share links whose snapshot
+        belongs to this script (runs.mode = 'share', joined via shares)
+
+    The server replays each session from the (current) start node, following
+    the historical choices in order and verifying every jump target; the first
+    divergence (start changed, node/option vanished, edge retargeted, early
+    termination or a finished run no longer ending) is reported as the
+    breakpoint. Unfinished runs are only checked up to the part they answered;
+    a full match is "compatible". This is a read-only query: it never saves
+    the script, never rewrites run records and never changes coverage stats.
+    """
+    _fetch_script(script_id)  # 404 if the script itself does not exist
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT r.id AS run_id, r.mode AS mode, r.finished AS finished, "
+            "r.steps AS steps, r.created_at AS created_at "
+            "FROM runs r LEFT JOIN shares s ON r.share_token = s.token "
+            "WHERE (r.mode = 'script' AND r.script_id = ?) "
+            "   OR (r.mode = 'share' AND s.script_id = ?) "
+            "ORDER BY r.id",
+            (script_id, script_id),
+        ).fetchall()
+    runs = [{
+        "run_id": row["run_id"],
+        "mode": row["mode"],
+        "finished": row["finished"],
+        "created_at": row["created_at"],
+        "steps": json.loads(row["steps"]),
+    } for row in rows]
+    result = analyze_impact(payload.content.model_dump(), runs)
+    result["script_id"] = script_id
+    return result
 
 
 # ---- import / export ------------------------------------------------------
